@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 import "dotenv";
 
 export const connectDB = async () => {
-  await mongoose.connect("mongodb+srv://codersrg_db_user:RzLUgwqybo0zjD3x@cluster0.amtlcip.mongodb.net/?appName=Cluster0")
+  await mongoose.connect(process.env.MONGODB_URI)
   .then(()=>{
     console.log("MongoDB connected");
   })
