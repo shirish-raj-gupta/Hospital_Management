@@ -1,7 +1,7 @@
 import mongoose from "mongoose";
 
 const doctorSchema = new mongoose.Schema({
-  enail: {
+  email: {
     type: String,
     required: true,
     unique: true,
