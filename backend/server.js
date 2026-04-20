@@ -5,6 +5,7 @@ import doctorRouter from './routes/doctorRouter.js';
 import serviceRouter from './routes/serviceRouter.js';
 import {clerkMiddleware} from '@clerk/express';
 import { connectDB } from './config/db.js';
+import appointmentRouter from './routes/appointmentRouter.js';
 
 const app=express();
 const PORT=4000;
@@ -27,6 +28,7 @@ app.get('/', (req,res)=>{
 
 app.use('/api/doctors', doctorRouter);
 app.use('/api/services', serviceRouter);
+app.use('/api/appointments', appointmentRouter);
 
 
 app.listen(PORT, ()=>{
