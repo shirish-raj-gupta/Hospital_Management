@@ -344,3 +344,327 @@ export const createServiceAppointment = async (req, res) => {
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };
+
+//confirm service payment
+export const confirmServicePayment = async (res, req) => {
+  try {
+    const { session_id } = req.query;
+    if (!session_id)
+      return res
+        .status(400)
+        .json({ success: false, message: "session_id is required" });
+
+    if (!stripe)
+      return res
+        .status(500)
+        .json({ success: false, message: "Stripe not configured on server" });
+
+    let session;
+    try {
+      session = await stripe.checkout.sessions.retrieve(session_id);
+    } catch (err) {
+      console.error("confirmServicePayment error:", err);
+      return res.status(500).json({ success: false, message: "Server error" });
+    }
+    if (!session)
+      return res
+        .status(404)
+        .json({ success: false, message: "Session not found" });
+
+    if (session.payment_status !== "paid") {
+      return res
+        .status(400)
+        .json({ success: false, message: "Payment not completed" });
+    }
+    let appt = await ServiceAppointment.findOneAndUpdate(
+      { "payment.sessionId": session_id },
+      {
+        $set: {
+          "payment.status": "Confirmed",
+          "payment.providerId": session.payment_intent || "",
+          "payment.paidAt": new Date(),
+          status: "Confirmed",
+        },
+      },
+      { new: true },
+    );
+
+    if (!appt && session.metadata?.appointmentId) {
+      appt = await ServiceAppointment.findOneAndUpdate(
+        { _id: session.metadata.appointmentId },
+        {
+          $set: {
+            "payment.status": "Confirmed",
+            "payment.providerId": session.payment_intent || "",
+            "payment.paidAt": new Date(),
+            status: "Confirmed",
+          },
+        },
+        { new: true },
+      );
+    }
+
+    if (!appt)
+      return res
+        .status(404)
+        .json({ success: false, message: "Service appointment not found" });
+
+    return res.status(200).json({ success: true, appointment: appt });
+  } catch (err) {
+    console.error("confirmServicePayment error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+//to getService Appointments of a user
+export const getServiceAppointments = async (req, res) => {
+  try {
+    const {
+      serviceId,
+      mobile,
+      status,
+      page: pageRaw = 1,
+      limit: limitRaw = 50,
+      search = "",
+    } = req.query;
+    const limit = Math.min(200, Math.max(1, parseInt(limitRaw, 10) || 50));
+    const page = Math.max(1, parseInt(pageRaw, 10) || 1);
+    const skip = (page - 1) * limit;
+
+    const filter = {};
+    if (serviceId) filter.serviceId = serviceId;
+    if (mobile) filter.mobile = mobile;
+    if (status) filter.status = status;
+    if (search) {
+      const re = new RegExp(search, "i");
+      filter.$or = [{ patientName: re }, { mobile: re }, { notes: re }];
+    }
+
+    const appointments = await ServiceAppointment.find(filter)
+      .populate("serviceId", "name image imageUrl imageSmall")
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+    const total = await ServiceAppointment.countDocuments(filter);
+    return res.status(200).json({
+      success: true,
+      appointments,
+      META: { total, page, limit, count: appointments.length },
+    });
+  } catch (err) {
+    console.error("getServiceAppointments error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+//to get a service appointment by id
+export const getServiceAppointmentById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const appt = await ServiceAppointment.findById(id).lean();
+    if (!appt)
+      return res
+        .status(404)
+        .json({ success: false, message: "Service appointment not found" });
+
+    return res.status(200).json({ success: true, appointment: appt });
+  } catch (err) {
+    console.error("getServiceAppointmentById error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+//update service appointment status
+export const updateServiceAppointmentStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { body } = req.body || {};
+    const update = {};
+
+    if (body.status !== undefined) updates.status = body.status;
+    if (body.notes !== undefined) updates.notes = body.notes;
+    if (body.payment !== undefined) updates.payment = body.payment;
+    if (body["payment.status"] !== undefined)
+      updates["payment.status"] = body["payment.status"];
+
+    if (body.rescheduledTo) {
+      const { date, time } = body.rescheduledTo || {};
+      updates.rescheduledTo = {};
+      if (date) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date))
+          return res
+            .status(400)
+            .json({
+              success: false,
+              message: "rescheduledTo.date must be YYYY-MM-DD",
+            });
+        updates.rescheduledTo.date = date;
+        updates.date = date;
+      }
+      if (time) {
+        updates.rescheduledTo.time = String(time);
+        const parsed = parseTimeString(String(time));
+        if (!parsed)
+          return res
+            .status(400)
+            .json({
+              success: false,
+              message: "rescheduledTo.time couldn't be parsed",
+            });
+        updates.hour = parsed.hour;
+        updates.minute = parsed.minute;
+        updates.ampm = parsed.ampm;
+        updates.time = `${String(parsed.hour).padStart(2, "0")}:${String(parsed.minute).padStart(2, "0")} ${parsed.ampm}`;
+      }
+      if (!body.status) updates.status = "Rescheduled";
+    }
+
+    if (updates.payment) {
+      const method = updates.payment.method || updates.payment?.method;
+      if (method && String(method).toLowerCase() === "online")
+        updates.status = updates.status || "Confirmed";
+      if (updates.payment.status && updates.payment.status === "Confirmed") {
+        updates.status = "Confirmed";
+        if (updates.payment.paidAt === undefined)
+          updates.payment.paidAt = new Date();
+      }
+    }
+
+    const updated = await ServiceAppointment.findByIdAndUpdate(
+      id,
+      { $set: updates },
+      { new: true, runValidators: true },
+    );
+    if (!updated)
+      return res
+        .status(404)
+        .json({ success: false, message: "Service appointment not found" });
+
+    return res.status(200).json({ success: true, data: updated });
+  } catch (err) {
+    console.error("updateServiceAppointmentStatus error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+//cancel a service appointment
+export const cancelServiceAppointment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const appt = await ServiceAppointment.findById(id);
+    if (!appt)
+      return res.status(404).json({ success: false, message: "Not found" });
+    if (appt.status === "Completed")
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "Cannot cancel a completed appointment",
+        });
+
+    appt.status = "Canceled";
+    if (appt.payment)
+      appt.payment.status =
+        appt.payment.status === "Confirmed" ? "Canceled" : "Pending";
+    await appt.save();
+    return res
+      .status(200)
+      .json({ success: true, message: "Service appointment canceled" });
+  } catch (err) {
+    console.error("cancelServiceAppointment error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+////to ge statistics
+export const getServiceAppointmentStats = async (req, res) => {
+  try {
+    const service = await Service.aggregate([
+      {
+        $lookup: {
+          from: "serviceappointments",
+          localField: "_id",
+          foreignField: "serviceId",
+          as: "appointments",
+        },
+      },
+      {
+        $addFields: {
+          totalAppointments: { $size: "$appointments" },
+          completed: {
+            $size: {
+              $filter: {
+                input: "$appointments",
+                as: "a",
+                cond: { $eq: ["$$a.status", "Completed"] },
+              },
+            },
+          },
+          canceled: {
+            $size: {
+              $filter: {
+                input: "$appointments",
+                as: "a",
+                cond: { $eq: ["$$a.status", "Canceled"] },
+              },
+            },
+          },
+        },
+      },
+      { $addFields: { earning: { $multiply: ["$completed", "$price"] } } },
+      {
+        $project: {
+          name: 1,
+          price: 1,
+          image: "$imageUrl",
+          totalAppointments: 1,
+          completed: 1,
+          canceled: 1,
+          earning: 1,
+        },
+      },
+      { $sort: { createdAt: -1 } },
+    ]);
+    return res.status(200).json({ success: true, data: service });
+  } catch (err) {
+    console.error("getServiceAppointmentStats error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+//to get appointment for the patient
+export const getServiceAppointmentsByPatient = async (req, res) => {
+  try {
+    const clerkUserId = resolveClerkUserId(req);
+    const { createdBy, mobile } = req.query;
+    const resolveCreatedBy = createdBy || clerkUserId || null;
+    if (!resolveCreatedBy && !mobile) {
+      return res
+        .status(401)
+        .json({ success: false, message: "Unauthorized", data: [] });
+    }
+    const filter = {};
+    if (resolveCreatedBy) filter.createdBy = resolveCreatedBy;
+    if (mobile) filter.mobile = mobile;
+
+    const list = await ServiceAppointment.find(filter)
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.status(200).json({ success: true, data: list });
+  } catch (err) {
+    console.error("getServiceAppointmentsByPatient error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+export default {
+  createServiceAppointment,
+  confirmServicePayment,
+  getServiceAppointments,
+  getServiceAppointmentById,
+  updateServiceAppointmentStatus,
+  cancelServiceAppointment,
+  getServiceAppointmentStats,
+  getServiceAppointmentsByPatient,
+};
